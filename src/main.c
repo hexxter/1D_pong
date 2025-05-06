@@ -1,402 +1,380 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
-#include "driver/rmt.h"
+#include "driver/rmt.h" // Behalte ich drin, falls du es für RMT direkt brauchst
 #include "led_strip.h"
 #include <stdio.h>
 #include "esp_log.h"
+#include <stdbool.h> // Für bool Typ
 
-static const char *TAG = "Game";
+static const char *TAG = "PongGame";
 
 #define NUM_LEDS 54
 #define LED_PIN GPIO_NUM_16
-#define BUTTON1_PIN GPIO_NUM_25
-#define BUTTON2_PIN GPIO_NUM_27
-#define INITIAL_LIVES 5
-#define INITIAL_SPEED 1
-#define SPEEDUP 1
-#define UPDATE_LOGIC_TIME 4
+#define BUTTON1_PIN GPIO_NUM_25 // Spieler Links
+#define BUTTON2_PIN GPIO_NUM_27 // Spieler Rechts
 
-typedef enum { LEFT, RIGHT, STOP } side_type;
+#define PADDLE_SIZE 3 // Anzahl LEDs für den Schläger
+#define INITIAL_LIVES 5
+#define INITIAL_BALL_SPEED 0.5f // Startgeschwindigkeit (LEDs pro Update-Zyklus)
+#define BALL_SPEED_INCREMENT 0.1f // Geschwindigkeitserhöhung pro Treffer
+#define BALL_UPDATE_INTERVAL_MS 50 // Wie oft der Ball logisch bewegt wird
+#define GAME_LOOP_DELAY_MS 10      // Haupt-Schleifen-Verzögerung
+
+typedef enum {
+    LEFT,
+    RIGHT,
+    STOP
+} direction_type;
+
+typedef enum {
+    GAME_STATE_INIT,          // Spiel wird initialisiert / Startbildschirm
+    GAME_STATE_WAIT_SERVE,    // Wartet auf Aufschlag
+    GAME_STATE_PLAYING,       // Ball ist im Spiel
+    GAME_STATE_POINT_SCORED,  // Punkt wurde erzielt, kurze Pause
+    GAME_STATE_GAME_OVER      // Spielende-Animation
+} GameState;
 
 typedef struct {
-    int pin;
-    bool down;
-    bool up;
-    bool isPressed;
+    gpio_num_t pin;
+    bool currentState;
+    bool lastState;
+    bool justPressed;
 } Button;
 
 typedef struct {
+    uint8_t lives;
+    direction_type side; // LEFT oder RIGHT
     uint32_t color;
-    uint16_t lives;
-    side_type side;
+    int paddle_pos_start; // Für Rendering
+    int paddle_pos_end;   // Für Rendering
 } Player;
 
 typedef struct {
-    uint32_t color;
     float position;
-    side_type direction;
+    direction_type direction;
     float speed;
+    uint32_t color;
 } Ball;
 
-Button button1, button2;
-
-Player p1, p2;
+Button button_p1, button_p2;
+Player player1, player2;
 Ball ball;
-bool quit = false;
-bool start = false;
-bool start_match = false;
+GameState currentGameState = GAME_STATE_INIT;
+Player *servingPlayer; // Zeiger auf den Spieler, der aufschlägt
 
-rgb_t black = {.r = 0, .g = 0, .b = 0}; // black color
-rgb_t white = {.r = 255, .g = 255, .b = 255}; // black color
-rgb_t red = {.r = 255, .g = 0, .b = 0}; // Red color
-
-rgb_t color_player1 = {.r = 0, .g = 255, .b = 0};
-rgb_t color_player2 = {.r = 0, .g = 0, .b = 255};
-
-rgb_t color_dead = {.r = 40, .g = 20, .b = 20};
-
-led_strip_t strip = {
-    .type = LED_STRIP_WS2812, // Set this according to your LED strip type
-    .length = NUM_LEDS,
-    .gpio = LED_PIN,
-    //.channel = RMT_CHANNEL_0,
-    .buf = NULL,
-    .brightness = 255,
-};
-
-void init_buttons() {
-    gpio_set_direction(BUTTON1_PIN, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(BUTTON1_PIN, GPIO_PULLUP_ONLY);
-
-    gpio_set_direction(BUTTON2_PIN, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(BUTTON2_PIN, GPIO_PULLUP_ONLY);
-
-    button1.pin = BUTTON1_PIN;
-    button2.pin = BUTTON2_PIN;
-
-    button1.up = true;
-    button2.up = true;
+// Farben (RGB)
+uint32_t colorToUint32(uint8_t r, uint8_t g, uint8_t b) {
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
 }
 
+rgb_t uint32ToRgb(uint32_t color) {
+    return (rgb_t){
+        .r = (color >> 16) & 0xFF,
+        .g = (color >> 8) & 0xFF,
+        .b = color & 0xFF};
+}
+
+const uint32_t COLOR_BLACK = 0x000000;
+const uint32_t COLOR_WHITE = 0xFFFFFF;
+const uint32_t COLOR_RED = 0xFF0000;
+const uint32_t COLOR_GREEN = 0x00FF00;
+const uint32_t COLOR_BLUE = 0x0000FF;
+const uint32_t COLOR_P1 = 0x00FF00; // Grün
+const uint32_t COLOR_P2 = 0x0000FF; // Blau
+const uint32_t COLOR_BALL = 0xFFFFFF; // Weiß
+const uint32_t COLOR_LIFE_LOST = 0x400000; // Dunkelrot
+
+led_strip_t strip;
+
+// --- LED Strip Funktionen ---
 void init_led_strip() {
-    led_strip_install(); // Install the LED strip driver
-    ESP_ERROR_CHECK(led_strip_init(&strip)); // Initialize the LED strip
+    strip.type = LED_STRIP_WS2812;
+    strip.length = NUM_LEDS;
+    strip.gpio = LED_PIN;
+    strip.buf = NULL; // Buffer wird von der Library alloziert
+    strip.brightness = 100; // Helligkeit reduzieren, um Strom zu sparen und Augen zu schonen
+
+    led_strip_install();
+    ESP_ERROR_CHECK(led_strip_init(&strip));
+    ESP_ERROR_CHECK(led_strip_clear(&strip)); // Alle LEDs ausschalten
+    ESP_LOGI(TAG, "LED strip initialized.");
 }
 
-void led_flush(led_strip_t *s){
-    led_strip_flush(s);
-    while(led_strip_busy(s));
+void set_pixel_color(int index, uint32_t color_val) {
+    if (index >= 0 && index < NUM_LEDS) {
+        led_strip_set_pixel(&strip, index, uint32ToRgb(color_val));
+    }
 }
 
-void setAllTo(uint32_t color) {
-    // Set all LEDs to a specific color
+void fill_color(uint32_t color_val) {
     for (int i = 0; i < NUM_LEDS; i++) {
-        rgb_t pixel_color = {
-            .r = (color >> 16) & 0xFF,
-            .g = (color >> 8) & 0xFF,
-            .b = color & 0xFF,
-        };
-        led_strip_set_pixel(&strip, i, pixel_color);
-    }
-    led_flush(&strip); // Update the strip with new colors
-}
-
-void processButtonInput(Button *button) {
-    int currentState = gpio_get_level(button->pin); // Read the current button state
-    bool pressed = !currentState;
-
-    if (pressed != button->isPressed) { // State has changed
-        if (pressed) {
-            button->down = false; // Button was just pressed
-            button->up = true;
-        } else {
-            button->up = false; // Button was just released
-            button->down = true;
-        }
-        ESP_LOGI(TAG, "Button [%d] is %d %d %d", button->pin, button->isPressed, button->down, button->up);
-    } else { // State is unchanged
-        button->down = false;
-        button->up = false;
-    }
-
-    button->isPressed = pressed;
-}
-
-void processInput() {
-    processButtonInput(&button1);
-    processButtonInput(&button2);
-}
-
-void startNewMatch(){
-    ball.speed = INITIAL_SPEED;
-    ball.position = NUM_LEDS / 2;
-    ball.direction = STOP;
-    start_match = true;
-}
-
-int but_num = 0;
-void watchNewMatch(){
-
-    if(start_match && (button1.isPressed || button2.isPressed) ){
-        start_match = false;
-        if(button1.isPressed){
-            but_num = 1;
-        }else{
-            but_num = 2;
-        }
-    }
-    if(but_num > 0){
-        if( but_num == 1){ 
-            if(!button1.isPressed){
-                ball.direction = RIGHT;
-                but_num = 0;
-            }
-        }else{
-            if(!button2.isPressed){
-                ball.direction = LEFT;
-                but_num = 0;
-            }
-        }
+        set_pixel_color(i, color_val);
     }
 }
 
-side_type changeDir(side_type dir){
-    ball.speed = ball.speed+SPEEDUP;
-    if(dir == LEFT) return RIGHT;
-    else return LEFT;
-}
+// --- Button Funktionen ---
+void init_buttons() {
+    button_p1.pin = BUTTON1_PIN;
+    button_p2.pin = BUTTON2_PIN;
+    Button *buttons[] = {&button_p1, &button_p2};
 
-void updateBall() {
-    if(ball.direction != STOP){
-    
-        // Example ball movement logic
-        if (ball.direction == LEFT) {
-            ball.position -= ball.speed;
-            if (ball.position < 0) {
-                ball.position = 0;
-                changeDir(ball.direction);
-                p1.lives--; // Player 1 loses a life
-                startNewMatch();
-            }
-        } else { // Ball moving right
-            ball.position += ball.speed;
-            if (ball.position > NUM_LEDS - 1) {
-                ball.position = NUM_LEDS - 1;
-                changeDir(ball.direction);
-                p2.lives--; // Player 2 loses a life
-                startNewMatch();
-            }
-        }
+    for (int i = 0; i < 2; i++) {
+        gpio_reset_pin(buttons[i]->pin);
+        gpio_set_direction(buttons[i]->pin, GPIO_MODE_INPUT);
+        gpio_set_pull_mode(buttons[i]->pin, GPIO_PULLUP_ONLY);
+        buttons[i]->currentState = false;
+        buttons[i]->lastState = false;
+        buttons[i]->justPressed = false;
     }
+    ESP_LOGI(TAG, "Buttons initialized.");
 }
 
-void startGame(){
-
-    if(start && (button1.isPressed || button2.isPressed) ){
-        start = false;
-        if(button1.isPressed){
-            ball.direction = RIGHT;
-        }else{
-            ball.direction = LEFT;
-        }
-    }
+void update_button(Button *button) {
+    button->lastState = button->currentState;
+    button->currentState = !gpio_get_level(button->pin); // Active low wegen PULLUP
+    button->justPressed = button->currentState && !button->lastState;
 }
 
-void initStartGame(){
-        ESP_LOGI(TAG, "start Game");
-        p1.lives = INITIAL_LIVES;
-        p2.lives = INITIAL_LIVES;
-        ball.speed = INITIAL_SPEED;
-        ball.position = NUM_LEDS / 2;
+void process_input() {
+    update_button(&button_p1);
+    update_button(&button_p2);
+}
+
+// --- Spiel Initialisierung ---
+void init_game_elements() {
+    player1.side = LEFT;
+    player1.lives = INITIAL_LIVES;
+    player1.color = COLOR_P1;
+    player1.paddle_pos_start = 0;
+    player1.paddle_pos_end = PADDLE_SIZE -1;
+
+    player2.side = RIGHT;
+    player2.lives = INITIAL_LIVES;
+    player2.color = COLOR_P2;
+    player2.paddle_pos_start = NUM_LEDS - PADDLE_SIZE;
+    player2.paddle_pos_end = NUM_LEDS -1;
+
+    ball.color = COLOR_BALL;
+    ball.speed = INITIAL_BALL_SPEED;
+
+    servingPlayer = &player1; // Spieler 1 beginnt mit dem Aufschlag
+    currentGameState = GAME_STATE_WAIT_SERVE;
+    ESP_LOGI(TAG, "Game elements initialized. Player 1 serves.");
+}
+
+void prepare_serve() {
+    ball.speed = INITIAL_BALL_SPEED;
+    if (servingPlayer->side == LEFT) {
+        ball.position = player1.paddle_pos_end + 1; // Knapp vor dem Schläger
+        ball.direction = STOP; // Wartet auf Aktion
+    } else {
+        ball.position = player2.paddle_pos_start - 1;
         ball.direction = STOP;
+    }
+    currentGameState = GAME_STATE_WAIT_SERVE;
 }
 
-int inPlayerRange(Player* p){
-    int score = -1;
-    if(p->side == LEFT){
-        if(ball.position <= INITIAL_LIVES){
-            score = INITIAL_LIVES-ball.position;
-        }
-    }else{
-        if(ball.position >= NUM_LEDS-INITIAL_LIVES){
-            score = ball.position-(NUM_LEDS-INITIAL_LIVES);
+// --- Spiel Logik ---
+void update_ball_position() {
+    if (ball.direction == LEFT) {
+        ball.position -= ball.speed;
+    } else if (ball.direction == RIGHT) {
+        ball.position += ball.speed;
+    }
+
+    // Kollision mit Wänden (Punktevergabe)
+    if (ball.position < 0) {
+        ESP_LOGI(TAG, "Ball out on left. Player 2 scores.");
+        player1.lives--;
+        servingPlayer = &player1; // Verlierer schlägt auf
+        currentGameState = GAME_STATE_POINT_SCORED;
+    } else if (ball.position >= NUM_LEDS) {
+        ESP_LOGI(TAG, "Ball out on right. Player 1 scores.");
+        player2.lives--;
+        servingPlayer = &player2;
+        currentGameState = GAME_STATE_POINT_SCORED;
+    }
+
+    // Kollision mit Schlägern
+    int ball_led_idx = (int)ball.position;
+
+    // Spieler 1 (links)
+    if (ball.direction == LEFT && ball_led_idx <= player1.paddle_pos_end && ball_led_idx >= player1.paddle_pos_start) {
+        if (button_p1.currentState) { // Schläger aktiv (Taste gehalten)
+            ESP_LOGI(TAG, "Player 1 hit!");
+            ball.direction = RIGHT;
+            ball.position = player1.paddle_pos_end + 0.1f; // knapp außerhalb des Schlägers positionieren
+            ball.speed += BALL_SPEED_INCREMENT;
         }
     }
-    return score;
+    // Spieler 2 (rechts)
+    else if (ball.direction == RIGHT && ball_led_idx >= player2.paddle_pos_start && ball_led_idx <= player2.paddle_pos_end) {
+         if (button_p2.currentState) { // Schläger aktiv (Taste gehalten)
+            ESP_LOGI(TAG, "Player 2 hit!");
+            ball.direction = LEFT;
+            ball.position = player2.paddle_pos_start - 0.1f;
+            ball.speed += BALL_SPEED_INCREMENT;
+        }
+    }
 }
 
 
-bool but1_state=false, but2_state=false;
-void checkUserAction(){
-
-    if(!start_match){
-        int p1_score=0, p2_score=0;
-        if(!but1_state && button1.isPressed){
-            but1_state = true;
-            p1_score = inPlayerRange(&p1);
-            ESP_LOGI(TAG, "P1 score %d", p1_score);
-            if(p1_score == -1){
-                    p1.lives--; // Player 1 loses a life
-                    startNewMatch();
-            }else{
-                ball.direction = changeDir(ball.direction);
-                ball.speed = ball.speed+(int)(p1_score/2);
-            }
-        }else if(!button1.isPressed){
-            but1_state = false;
-        }
-        if(!but2_state && button2.isPressed){
-            but2_state = true;
-            p2_score = inPlayerRange(&p2);
-            ESP_LOGI(TAG, "P2 score %d", p2_score);
-            if(p2_score == -1){
-                    p2.lives--; // Player 2 loses a life
-                    startNewMatch();
-            }else{
-                ball.direction = changeDir(ball.direction);
-                ball.speed = ball.speed+(int)(p2_score/2);
-            }
-        }else if(!button2.isPressed){
-            but2_state = false;
-        }
-    } 
-}
-
-bool knightRiderAnimation() {
-    int animationSpeed = 70; // Adjust for desired animation speed, lower is faster
-    int width = 5; // Width of the moving light
-    int repeats = 1; // Number of times the animation repeats
-
+void knightRiderAnimation(uint32_t color, int width, int repeats, int anim_speed_ms) {
     for (int r = 0; r < repeats; r++) {
-        // Move light to the right
         for (int i = 0; i <= NUM_LEDS - width; i++) {
-            led_strip_fill(&strip, 0, NUM_LEDS, black);
-            for (int j = i; j < i + width; j++) {
-                // Ensuring j is within the bounds of the LED strip
-                if (j >= 0 && j < NUM_LEDS) {
-                    led_strip_set_pixel(&strip, j, red);
-                }
+            if (currentGameState != GAME_STATE_INIT && currentGameState != GAME_STATE_GAME_OVER) return; // Abbruch wenn Spielzustand sich ändert
+            fill_color(COLOR_BLACK);
+            for (int j = 0; j < width; j++) {
+                set_pixel_color(i + j, color);
             }
-            led_flush(&strip);
-            vTaskDelay(pdMS_TO_TICKS(animationSpeed));
+            led_strip_flush(&strip);
+            vTaskDelay(pdMS_TO_TICKS(anim_speed_ms));
         }
-
-        // Move light to the left
-        for (int i = NUM_LEDS - width; i >= 0; i--) {
-            led_strip_fill(&strip, 0, NUM_LEDS, black);
-            for (int j = i; j < i + width; j++) {
-                // Ensuring j is within the bounds of the LED strip
-                if (j >= 0 && j < NUM_LEDS) {
-                    led_strip_set_pixel(&strip, j, red);
-                }
+        for (int i = NUM_LEDS - width -1; i >= 0; i--) {
+            if (currentGameState != GAME_STATE_INIT && currentGameState != GAME_STATE_GAME_OVER) return;
+            fill_color(COLOR_BLACK);
+            for (int j = 0; j < width; j++) {
+                set_pixel_color(i + j, color);
             }
-            led_flush(&strip);
-            vTaskDelay(pdMS_TO_TICKS(animationSpeed));
-        }
-    }
-    return true;
-}
-
-void checkGameOver() {
-    if (p1.lives <= 0 || p2.lives <= 0) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        knightRiderAnimation();
-        initStartGame();
-        start = true;
-    }
-}
-
-
-int update_count = 0;
-void updateGame() {
-    processInput(); // Process input to potentially change the ball's direction
-    checkUserAction();
-    watchNewMatch();
-    checkGameOver(); // Check for game over condition
-    startGame();
-    if(update_count >= UPDATE_LOGIC_TIME){
-        update_count = 0;
-        updateBall(); // Update the ball's position and handle bouncing
-    }else{
-        update_count++;
-    }
-}
-
-void renderPlayer(Player* p) {
-    int ledIndex;
-
-    if (p->side == LEFT) {
-        for (int i = 0; i < p->lives; i++) {
-            ledIndex = i; // Starting from the left end for player 1
-            led_strip_set_pixel(&strip, ledIndex, color_player1);
-        }
-        for (int i = p->lives; i < INITIAL_LIVES; i++) {
-            ledIndex = i; // Starting from the left end for player 1
-            led_strip_set_pixel(&strip, ledIndex, color_dead);
-        }
-    } else { // RIGHT
-        for (int i = 0; i < p->lives; i++) {
-            ledIndex = NUM_LEDS - 1 - i; // Starting from the right end for player 2
-            led_strip_set_pixel(&strip, ledIndex, color_player2);
-        }
-        for (int i = p->lives; i < INITIAL_LIVES; i++) {
-            ledIndex = NUM_LEDS - 1 - i; // Starting from the right end for player 2
-            led_strip_set_pixel(&strip, ledIndex, color_dead);
+            led_strip_flush(&strip);
+            vTaskDelay(pdMS_TO_TICKS(anim_speed_ms));
         }
     }
 }
 
-void renderBall() {
-    int ballIndex = (int)ball.position; // Convert ball's float position to an int for the LED index
-    led_strip_set_pixel(&strip, ballIndex, white);
-}
+void game_update_logic() {
+    static uint32_t last_ball_update_time = 0;
+    uint32_t current_time = esp_log_timestamp(); // Gibt Millisekunden seit Boot
 
-void drawGame() {
-    led_strip_fill(&strip, 0, NUM_LEDS, black);
+    switch (currentGameState) {
+        case GAME_STATE_INIT:
+            knightRiderAnimation(COLOR_RED, 5, 1, 70); // Startanimation
+            init_game_elements(); // Setzt auch auf WAIT_SERVE
+            // Fall through zu WAIT_SERVE, da init_game_elements den State setzt
+            // oder explizit setzen: currentGameState = GAME_STATE_WAIT_SERVE;
+            break;
 
-    renderPlayer(&p1); // Draw player 1
-    renderPlayer(&p2); // Draw player 2
-    renderBall(); // Draw the ball
+        case GAME_STATE_WAIT_SERVE:
+            // Ball steht still, wird in prepare_serve() positioniert
+            if (servingPlayer == &player1 && button_p1.justPressed) {
+                ball.direction = RIGHT;
+                currentGameState = GAME_STATE_PLAYING;
+                ESP_LOGI(TAG, "Player 1 serves right.");
+            } else if (servingPlayer == &player2 && button_p2.justPressed) {
+                ball.direction = LEFT;
+                currentGameState = GAME_STATE_PLAYING;
+                ESP_LOGI(TAG, "Player 2 serves left.");
+            }
+            break;
 
-    led_flush(&strip); // Update the strip to show the new LED states
-}
+        case GAME_STATE_PLAYING:
+            if ((current_time - last_ball_update_time) >= BALL_UPDATE_INTERVAL_MS) {
+                update_ball_position();
+                last_ball_update_time = current_time;
+            }
+            break;
 
+        case GAME_STATE_POINT_SCORED:
+            ESP_LOGI(TAG, "Point scored. P1 Lives: %d, P2 Lives: %d", player1.lives, player2.lives);
+            // Kurze Pause oder Animation
+            fill_color(COLOR_BLACK); // Alles aus
+            if (servingPlayer == &player1) { // Player1 hat verloren, Player2 hat Punkt
+                 for(int i=0; i<NUM_LEDS/2; i++) set_pixel_color(NUM_LEDS/2 + i, player2.color);
+            } else { // Player2 hat verloren, Player1 hat Punkt
+                 for(int i=0; i<NUM_LEDS/2; i++) set_pixel_color(i, player1.color);
+            }
+            led_strip_flush(&strip);
+            vTaskDelay(pdMS_TO_TICKS(1000)); // 1 Sekunde Pause
 
-void testLEDStrip() {
-    for (int i = 0; i < NUM_LEDS; i++) {
-        led_strip_fill(&strip, 0, NUM_LEDS, black);
-        led_strip_set_pixel(&strip, i, white);
-        led_flush(&strip);
-        vTaskDelay(pdMS_TO_TICKS(50)); // Wait for a quarter second
+            if (player1.lives == 0 || player2.lives == 0) {
+                currentGameState = GAME_STATE_GAME_OVER;
+            } else {
+                prepare_serve(); // Bereitet nächsten Aufschlag vor
+            }
+            break;
+
+        case GAME_STATE_GAME_OVER:
+            ESP_LOGI(TAG, "Game Over!");
+            uint32_t winner_color = (player1.lives > 0) ? player1.color : player2.color;
+            for(int i=0; i<3; i++){ // Blinken lassen
+                fill_color(winner_color);
+                led_strip_flush(&strip);
+                vTaskDelay(pdMS_TO_TICKS(300));
+                fill_color(COLOR_BLACK);
+                led_strip_flush(&strip);
+                vTaskDelay(pdMS_TO_TICKS(300));
+            }
+            // Warte auf einen Button-Druck für neues Spiel
+            if (button_p1.justPressed || button_p2.justPressed) {
+                 currentGameState = GAME_STATE_INIT; // Zurück zum Start
+            }
+            break;
     }
-    led_strip_fill(&strip, 0, NUM_LEDS, black);
-    led_flush(&strip);
 }
 
+// --- Rendering ---
+void render_paddles_and_lives() {
+    // Spieler 1 Schläger und Leben
+    for (int i = 0; i < PADDLE_SIZE; i++) {
+        set_pixel_color(player1.paddle_pos_start + i, player1.color);
+    }
+    for (int i = 0; i < player1.lives; i++) {
+         set_pixel_color(player1.paddle_pos_end + 1 + i, player1.color); // Leben direkt nach dem Schläger
+    }
+     for (int i = player1.lives; i < INITIAL_LIVES; i++) { // "Verlorene" Leben
+         set_pixel_color(player1.paddle_pos_end + 1 + i, COLOR_LIFE_LOST);
+    }
 
-void game_task(void *pvParameter) {
+
+    // Spieler 2 Schläger und Leben
+    for (int i = 0; i < PADDLE_SIZE; i++) {
+        set_pixel_color(player2.paddle_pos_start + i, player2.color);
+    }
+    for (int i = 0; i < player2.lives; i++) {
+        set_pixel_color(player2.paddle_pos_start - 1 - i, player2.color); // Leben direkt vor dem Schläger
+    }
+    for (int i = player2.lives; i < INITIAL_LIVES; i++) { // "Verlorene" Leben
+        set_pixel_color(player2.paddle_pos_start - 1 - i, COLOR_LIFE_LOST);
+    }
+}
+
+void render_ball() {
+    if (currentGameState == GAME_STATE_PLAYING || currentGameState == GAME_STATE_WAIT_SERVE) {
+        int ball_led_idx = (int)ball.position;
+        if (ball_led_idx >=0 && ball_led_idx < NUM_LEDS) {
+             set_pixel_color(ball_led_idx, ball.color);
+        }
+    }
+}
+
+void draw_game() {
+    if (currentGameState != GAME_STATE_INIT && currentGameState != GAME_STATE_GAME_OVER && currentGameState != GAME_STATE_POINT_SCORED) {
+        fill_color(COLOR_BLACK); // Hintergrund löschen
+        render_paddles_and_lives();
+        render_ball();
+        led_strip_flush(&strip);
+    }
+    // Die anderen States (INIT, GAME_OVER, POINT_SCORED) handhaben ihr Rendering selbst
+}
+
+// --- Haupt-Task ---
+void game_task(void *pvParameters) {
     ESP_LOGI(TAG, "Game task started.");
-    //knightRiderAnimation();
-    while (!quit) {
-        processInput();
-        updateGame();
-        drawGame();
-        vTaskDelay(pdMS_TO_TICKS(40)); // Adjust based on game speed requirements
+    init_led_strip();
+    init_buttons();
+    
+    currentGameState = GAME_STATE_INIT; // Startzustand
+
+    while (true) {
+        process_input();
+        game_update_logic();
+        draw_game();
+        vTaskDelay(pdMS_TO_TICKS(GAME_LOOP_DELAY_MS));
     }
-    ESP_LOGI(TAG, "Game task ending.");
 }
 
-void app_main() {
-    init_led_strip();
-    testLEDStrip();
-    init_buttons();
-
-    // Initialize players, ball, and game state
-    p1.side = LEFT;
-    p2.side = RIGHT;
-    initStartGame();
-    start = true;
-
-    xTaskCreate(game_task, "game_task", 4096, NULL, 8, NULL);
+void app_main(void) {
+    esp_log_level_set(TAG, ESP_LOG_INFO);
+    xTaskCreate(game_task, "game_task", 4096, NULL, 5, NULL);
 }
