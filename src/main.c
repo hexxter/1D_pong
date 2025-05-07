@@ -18,7 +18,7 @@ static const char *TAG = "PongGame";
 #define PADDLE_SIZE 6     // Number of LEDs for the paddle (as seen in video)
 #define INITIAL_LIVES 5
 #define INITIAL_BALL_SPEED 0.4f   // Start speed (LEDs per update-cycle) - adjusted for feel
-#define BALL_SPEED_INCREMENT 0.05f // Speed increase per hit - adjusted
+#define BALL_SPEED_INCREMENT 0.08f // Speed increase per hit - adjusted
 #define BALL_UPDATE_INTERVAL_MS 40 // How often the ball logically moves (ms)
 #define GAME_LOOP_DELAY_MS 10      // Main loop delay (ms)
 
