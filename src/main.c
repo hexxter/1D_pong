@@ -18,7 +18,9 @@ static const char *TAG = "PongGame";
 #define PADDLE_SIZE 6     // Number of LEDs for the paddle (as seen in video)
 #define INITIAL_LIVES 5
 #define INITIAL_BALL_SPEED 0.4f   // Start speed (LEDs per update-cycle) - adjusted for feel
-#define BALL_SPEED_INCREMENT 0.08f // Speed increase per hit - adjusted
+// #define BALL_SPEED_INCREMENT 0.08f // Speed increase per hit - adjusted
+static const float BASE_BALL_SPEED_INCREMENT = 0.05f;
+static const float RISKY_HIT_EXTRA_INCREMENT = 0.10f;
 #define BALL_UPDATE_INTERVAL_MS 40 // How often the ball logically moves (ms)
 #define GAME_LOOP_DELAY_MS 10      // Main loop delay (ms)
 
@@ -212,14 +214,23 @@ void update_ball_position() {
 
     // Collision with Paddles
     // Player 1 (left)
-    if (ball.direction == LEFT && ball_led_idx <= player1.paddle_pos_end && ball_led_idx >= player1.paddle_pos_start) {
+    if (ball.direction == LEFT && ball_led_idx >= player1.paddle_pos_start && ball_led_idx <= player1.paddle_pos_end) {
         if (button_p1.currentState) { // Paddle active (button held)
             ESP_LOGI(TAG, "Player 1 hit! Ball at %d, Paddle [%d-%d]", ball_led_idx, player1.paddle_pos_start, player1.paddle_pos_end);
             ball.direction = RIGHT;
             ball.position = player1.paddle_pos_end + 0.1f; // Move slightly out of paddle
-            ball.speed += BALL_SPEED_INCREMENT;
+            int impact_offset_p1 = ball_led_idx - player1.paddle_pos_start;
+            float dynamic_speed_increment_p1 = BASE_BALL_SPEED_INCREMENT + ((float)impact_offset_p1 / (PADDLE_SIZE - 1.0f)) * RISKY_HIT_EXTRA_INCREMENT;
+            ESP_LOGI(TAG, "P1 Impact Offset: %d (Paddle: %d-%d, Ball: %d), DynInc: %.3f", impact_offset_p1, player1.paddle_pos_start, player1.paddle_pos_end, ball_led_idx, dynamic_speed_increment_p1);
+            ball.speed += dynamic_speed_increment_p1;
             if (ball.speed > 1.5f) ball.speed = 1.5f; // Max speed
             ESP_LOGI(TAG, "New ball speed: %.2f", ball.speed);
+        } else { // Player 1 missed
+            ESP_LOGI(TAG, "Player 1 missed! Ball at %d, Paddle [%d-%d], button not pressed.", ball_led_idx, player1.paddle_pos_start, player1.paddle_pos_end);
+            player1.lives--;
+            servingPlayer = &player1; // Loser serves
+            currentGameState = GAME_STATE_POINT_SCORED;
+            return; // Exit early as point is scored
         }
     }
     // Player 2 (right)
@@ -228,9 +239,18 @@ void update_ball_position() {
             ESP_LOGI(TAG, "Player 2 hit! Ball at %d, Paddle [%d-%d]", ball_led_idx, player2.paddle_pos_start, player2.paddle_pos_end);
             ball.direction = LEFT;
             ball.position = player2.paddle_pos_start - 0.1f; // Move slightly out of paddle
-            ball.speed += BALL_SPEED_INCREMENT;
+            int impact_offset_p2 = player2.paddle_pos_end - ball_led_idx;
+            float dynamic_speed_increment_p2 = BASE_BALL_SPEED_INCREMENT + ((float)impact_offset_p2 / (PADDLE_SIZE - 1.0f)) * RISKY_HIT_EXTRA_INCREMENT;
+            ESP_LOGI(TAG, "P2 Impact Offset: %d (Paddle: %d-%d, Ball: %d), DynInc: %.3f", impact_offset_p2, player2.paddle_pos_start, player2.paddle_pos_end, ball_led_idx, dynamic_speed_increment_p2);
+            ball.speed += dynamic_speed_increment_p2;
             if (ball.speed > 1.5f) ball.speed = 1.5f; // Max speed
             ESP_LOGI(TAG, "New ball speed: %.2f", ball.speed);
+        } else { // Player 2 missed
+            ESP_LOGI(TAG, "Player 2 missed! Ball at %d, Paddle [%d-%d], button not pressed.", ball_led_idx, player2.paddle_pos_start, player2.paddle_pos_end);
+            player2.lives--;
+            servingPlayer = &player2; // Loser serves
+            currentGameState = GAME_STATE_POINT_SCORED;
+            return; // Exit early
         }
     }
 }
