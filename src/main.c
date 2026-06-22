@@ -17,10 +17,12 @@ static const char *TAG = "PongGame";
 
 #define PADDLE_SIZE 6     // Number of LEDs for the paddle (as seen in video)
 #define INITIAL_LIVES 5
-#define INITIAL_BALL_SPEED 0.4f   // Start speed (LEDs per update-cycle) - adjusted for feel
-#define BALL_SPEED_INCREMENT 0.08f // Speed increase per hit - adjusted
-#define BALL_UPDATE_INTERVAL_MS 40 // How often the ball logically moves (ms)
-#define GAME_LOOP_DELAY_MS 10      // Main loop delay (ms)
+#define INITIAL_BALL_SPEED 0.5f        // Start speed (LEDs per update-cycle)
+#define BALL_SPEED_MULT 1.12f          // Multiplicative speed growth per successful hit
+#define BALL_SPEED_CAP 4.0f            // Max ball speed (LEDs per tick)
+#define BALL_UPDATE_INTERVAL_MS 30     // Base ball tick interval (ms); shrinks with rally
+#define BALL_UPDATE_INTERVAL_MIN_MS 15 // Floor for tick interval at high rally counts
+#define GAME_LOOP_DELAY_MS 10          // Main loop delay (ms)
 
 typedef enum {
     LEFT,
@@ -63,6 +65,7 @@ Player player1, player2;
 Ball ball;
 GameState currentGameState = GAME_STATE_INIT;
 Player *servingPlayer; // Pointer to the player who serves
+int rallyCount = 0;    // Successful hits in current game; drives difficulty curve (reset on game over)
 
 // --- Color Definitions (RGB) ---
 uint32_t colorToUint32(uint8_t r, uint8_t g, uint8_t b) {
@@ -160,6 +163,7 @@ void init_game_elements() {
 
     ball.color = COLOR_BALL;
     ball.speed = INITIAL_BALL_SPEED;
+    rallyCount = 0; // Reset difficulty ramp for a new game
 
     // Alternate starting player or P1 starts
     if (servingPlayer == &player1) {
@@ -173,7 +177,8 @@ void init_game_elements() {
 }
 
 void prepare_serve() {
-    ball.speed = INITIAL_BALL_SPEED; // Reset speed for new serve
+    // NOTE: ball.speed is intentionally NOT reset here so difficulty carries
+    // across points within a game. It is reset only on a new game (init_game_elements).
     if (servingPlayer->side == LEFT) {
         ball.position = player1.paddle_pos_end + 1.0f; // Just in front of the paddle
         ball.direction = STOP; // Waits for action
@@ -217,9 +222,10 @@ void update_ball_position() {
             ESP_LOGI(TAG, "Player 1 hit! Ball at %d, Paddle [%d-%d]", ball_led_idx, player1.paddle_pos_start, player1.paddle_pos_end);
             ball.direction = RIGHT;
             ball.position = player1.paddle_pos_end + 0.1f; // Move slightly out of paddle
-            ball.speed += BALL_SPEED_INCREMENT;
-            if (ball.speed > 1.5f) ball.speed = 1.5f; // Max speed
-            ESP_LOGI(TAG, "New ball speed: %.2f", ball.speed);
+            rallyCount++;
+            ball.speed *= BALL_SPEED_MULT;
+            if (ball.speed > BALL_SPEED_CAP) ball.speed = BALL_SPEED_CAP;
+            ESP_LOGI(TAG, "New ball speed: %.2f (rally %d)", ball.speed, rallyCount);
         }
     }
     // Player 2 (right)
@@ -228,9 +234,10 @@ void update_ball_position() {
             ESP_LOGI(TAG, "Player 2 hit! Ball at %d, Paddle [%d-%d]", ball_led_idx, player2.paddle_pos_start, player2.paddle_pos_end);
             ball.direction = LEFT;
             ball.position = player2.paddle_pos_start - 0.1f; // Move slightly out of paddle
-            ball.speed += BALL_SPEED_INCREMENT;
-            if (ball.speed > 1.5f) ball.speed = 1.5f; // Max speed
-            ESP_LOGI(TAG, "New ball speed: %.2f", ball.speed);
+            rallyCount++;
+            ball.speed *= BALL_SPEED_MULT;
+            if (ball.speed > BALL_SPEED_CAP) ball.speed = BALL_SPEED_CAP;
+            ESP_LOGI(TAG, "New ball speed: %.2f (rally %d)", ball.speed, rallyCount);
         }
     }
 }
@@ -332,8 +339,13 @@ void game_update_logic() {
             }
             break;
 
-        case GAME_STATE_PLAYING:
-            if ((current_time_ms - last_ball_update_time) >= BALL_UPDATE_INTERVAL_MS) {
+        case GAME_STATE_PLAYING: {
+            // Dynamic tick interval: shrinks as the rally grows, clamped to a floor
+            uint32_t ball_tick_interval = BALL_UPDATE_INTERVAL_MS - (rallyCount / 2);
+            if (ball_tick_interval < BALL_UPDATE_INTERVAL_MIN_MS) {
+                ball_tick_interval = BALL_UPDATE_INTERVAL_MIN_MS;
+            }
+            if ((current_time_ms - last_ball_update_time) >= ball_tick_interval) {
                 update_ball_position();
                 last_ball_update_time = current_time_ms;
             }
@@ -344,6 +356,7 @@ void game_update_logic() {
                 currentGameState = GAME_STATE_GAME_OVER;
             }
             break;
+        }
 
         case GAME_STATE_POINT_SCORED:
             ESP_LOGI(TAG, "State: GAME_STATE_POINT_SCORED. P1 Lives: %d, P2 Lives: %d", player1.lives, player2.lives);
