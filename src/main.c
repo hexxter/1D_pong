@@ -20,6 +20,7 @@ static const char *TAG = "PongGame";
 #define INITIAL_BALL_SPEED 0.5f        // Start speed (LEDs per update-cycle)
 #define BALL_SPEED_MULT 1.12f          // Multiplicative speed growth per successful hit
 #define BALL_SPEED_CAP 4.0f            // Max ball speed (LEDs per tick)
+#define PADDLE_HIT_FACTOR 0.25f        // Max +/- speed modifier based on hit position on paddle (25%)
 #define BALL_UPDATE_INTERVAL_MS 30     // Base ball tick interval (ms); shrinks with rally
 #define BALL_UPDATE_INTERVAL_MIN_MS 15 // Floor for tick interval at high rally counts
 #define GAME_LOOP_DELAY_MS 10          // Main loop delay (ms)
@@ -177,8 +178,9 @@ void init_game_elements() {
 }
 
 void prepare_serve() {
-    // NOTE: ball.speed is intentionally NOT reset here so difficulty carries
-    // across points within a game. It is reset only on a new game (init_game_elements).
+    // Reset ball speed to the initial value for every new serve (after each point).
+    ball.speed = INITIAL_BALL_SPEED;
+    rallyCount = 0;
     if (servingPlayer->side == LEFT) {
         ball.position = player1.paddle_pos_end + 1.0f; // Just in front of the paddle
         ball.direction = STOP; // Waits for action
@@ -191,14 +193,96 @@ void prepare_serve() {
 }
 
 // --- Game Logic ---
+// Computes a speed modifier (1.0 +/- up to PADDLE_HIT_FACTOR) based on where the
+// ball hit the paddle. Center = 0% (1.0). Front (toward opponent) = up to -25%.
+// Back (toward the player/wall) = up to +25%. Linearly interpolated.
+float paddle_hit_factor(Player *p, int ball_led_idx) {
+    // Normalized position along the paddle: 0.0 at paddle_pos_start, 1.0 at paddle_pos_end
+    float t;
+    if (PADDLE_SIZE > 1) {
+        t = (float)(ball_led_idx - p->paddle_pos_start) / (float)(PADDLE_SIZE - 1);
+    } else {
+        t = 0.5f;
+    }
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+
+    // Map t (0..1) to -1..+1 where -1 = paddle_pos_start end, +1 = paddle_pos_end end
+    float rel = (t - 0.5f) * 2.0f; // -1 .. +1, 0 = center
+
+    // Determine which end is "front" (toward opponent) and which is "back" (toward player).
+    // P1 (LEFT): front = paddle_pos_end (t=1, rel=+1), back = paddle_pos_start (t=0, rel=-1)
+    // P2 (RIGHT): front = paddle_pos_start (t=0, rel=-1), back = paddle_pos_end (t=1, rel=+1)
+    float back_amount; // -1 (full front) .. +1 (full back)
+    if (p->side == LEFT) {
+        back_amount = -rel; // back is at start (rel=-1) -> +1
+    } else {
+        back_amount = rel;  // back is at end (rel=+1) -> +1
+    }
+
+    return 1.0f + back_amount * PADDLE_HIT_FACTOR;
+}
+
+// Handles a fresh button press during play: either a paddle hit (if the ball is
+// on the player's paddle and moving toward them) or a penalty (if they press
+// while the ball is approaching but NOT on their paddle).
+// Called every loop iteration so a press is never missed between ball ticks.
+void handle_paddle_input() {
+    int ball_led_idx = (int)(ball.position + 0.5f);
+
+    // Player 1 (left)
+    if (button_p1.justPressed && ball.direction == LEFT) {
+        if (ball_led_idx >= player1.paddle_pos_start && ball_led_idx <= player1.paddle_pos_end) {
+            // Hit
+            ESP_LOGI(TAG, "Player 1 hit! Ball at %d, Paddle [%d-%d]", ball_led_idx, player1.paddle_pos_start, player1.paddle_pos_end);
+            ball.direction = RIGHT;
+            ball.position = player1.paddle_pos_end + 0.1f;
+            rallyCount++;
+            ball.speed *= BALL_SPEED_MULT;
+            ball.speed *= paddle_hit_factor(&player1, ball_led_idx);
+            if (ball.speed > BALL_SPEED_CAP) ball.speed = BALL_SPEED_CAP;
+            if (ball.speed < INITIAL_BALL_SPEED) ball.speed = INITIAL_BALL_SPEED;
+            ESP_LOGI(TAG, "New ball speed: %.2f (rally %d)", ball.speed, rallyCount);
+        } else {
+            // Mis-press penalty: ball approaching but not on paddle
+            ESP_LOGI(TAG, "Player 1 mis-press penalty! Ball at %d", ball_led_idx);
+            player1.lives--;
+            servingPlayer = &player1;
+            currentGameState = GAME_STATE_POINT_SCORED;
+        }
+        return;
+    }
+
+    // Player 2 (right)
+    if (button_p2.justPressed && ball.direction == RIGHT) {
+        if (ball_led_idx >= player2.paddle_pos_start && ball_led_idx <= player2.paddle_pos_end) {
+            // Hit
+            ESP_LOGI(TAG, "Player 2 hit! Ball at %d, Paddle [%d-%d]", ball_led_idx, player2.paddle_pos_start, player2.paddle_pos_end);
+            ball.direction = LEFT;
+            ball.position = player2.paddle_pos_start - 0.1f;
+            rallyCount++;
+            ball.speed *= BALL_SPEED_MULT;
+            ball.speed *= paddle_hit_factor(&player2, ball_led_idx);
+            if (ball.speed > BALL_SPEED_CAP) ball.speed = BALL_SPEED_CAP;
+            if (ball.speed < INITIAL_BALL_SPEED) ball.speed = INITIAL_BALL_SPEED;
+            ESP_LOGI(TAG, "New ball speed: %.2f (rally %d)", ball.speed, rallyCount);
+        } else {
+            // Mis-press penalty: ball approaching but not on paddle
+            ESP_LOGI(TAG, "Player 2 mis-press penalty! Ball at %d", ball_led_idx);
+            player2.lives--;
+            servingPlayer = &player2;
+            currentGameState = GAME_STATE_POINT_SCORED;
+        }
+        return;
+    }
+}
+
 void update_ball_position() {
     if (ball.direction == LEFT) {
         ball.position -= ball.speed;
     } else if (ball.direction == RIGHT) {
         ball.position += ball.speed;
     }
-
-    int ball_led_idx = (int)(ball.position + 0.5f); // Round to nearest LED
 
     // Collision with Walls (Points)
     if (ball.position < 0) { // Ball went past player 1
@@ -213,32 +297,6 @@ void update_ball_position() {
         servingPlayer = &player2; // Loser serves
         currentGameState = GAME_STATE_POINT_SCORED;
         return; // Exit early
-    }
-
-    // Collision with Paddles
-    // Player 1 (left)
-    if (ball.direction == LEFT && ball_led_idx <= player1.paddle_pos_end && ball_led_idx >= player1.paddle_pos_start) {
-        if (button_p1.currentState) { // Paddle active (button held)
-            ESP_LOGI(TAG, "Player 1 hit! Ball at %d, Paddle [%d-%d]", ball_led_idx, player1.paddle_pos_start, player1.paddle_pos_end);
-            ball.direction = RIGHT;
-            ball.position = player1.paddle_pos_end + 0.1f; // Move slightly out of paddle
-            rallyCount++;
-            ball.speed *= BALL_SPEED_MULT;
-            if (ball.speed > BALL_SPEED_CAP) ball.speed = BALL_SPEED_CAP;
-            ESP_LOGI(TAG, "New ball speed: %.2f (rally %d)", ball.speed, rallyCount);
-        }
-    }
-    // Player 2 (right)
-    else if (ball.direction == RIGHT && ball_led_idx >= player2.paddle_pos_start && ball_led_idx <= player2.paddle_pos_end) {
-         if (button_p2.currentState) { // Paddle active (button held)
-            ESP_LOGI(TAG, "Player 2 hit! Ball at %d, Paddle [%d-%d]", ball_led_idx, player2.paddle_pos_start, player2.paddle_pos_end);
-            ball.direction = LEFT;
-            ball.position = player2.paddle_pos_start - 0.1f; // Move slightly out of paddle
-            rallyCount++;
-            ball.speed *= BALL_SPEED_MULT;
-            if (ball.speed > BALL_SPEED_CAP) ball.speed = BALL_SPEED_CAP;
-            ESP_LOGI(TAG, "New ball speed: %.2f (rally %d)", ball.speed, rallyCount);
-        }
     }
 }
 
@@ -340,6 +398,13 @@ void game_update_logic() {
             break;
 
         case GAME_STATE_PLAYING: {
+            // Handle paddle hits / mis-press penalties every loop so a fresh
+            // button press is never missed between (slower) ball ticks.
+            handle_paddle_input();
+            if (currentGameState != GAME_STATE_PLAYING) {
+                break; // A penalty may have ended the rally
+            }
+
             // Dynamic tick interval: shrinks as the rally grows, clamped to a floor
             uint32_t ball_tick_interval = BALL_UPDATE_INTERVAL_MS - (rallyCount / 2);
             if (ball_tick_interval < BALL_UPDATE_INTERVAL_MIN_MS) {
